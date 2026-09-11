@@ -43,12 +43,18 @@ def _make_client(url: str | None, token: str | None):
     )
 
 
-def _resolve_connector(source: str, branch: str | None = None, path: str | None = None):
+def _resolve_connector(source: str, branch: str | None = None, path: str | None = None, token: str | None = none):
     """Resolve a source string to the appropriate connector."""
     if source.startswith("github:"):
         from oikb.connectors.github import GitHubConnector, parse_github_source
         parsed = parse_github_source(source)
-        return GitHubConnector(owner=parsed["owner"], repo=parsed["repo"], branch=branch, path=path or parsed.get("path"))
+        return GitHubConnector(
+            owner=parsed["owner"],
+            repo=parsed["repo"],
+            branch=branch,
+            path=path or parsed.get("path"),
+            token=token,
+        )
 
     if source.startswith("gitlab:"):
         from oikb.connectors.gitlab import GitLabConnector, parse_gitlab_source
@@ -59,6 +65,7 @@ def _resolve_connector(source: str, branch: str | None = None, path: str | None 
             branch=branch,
             path=path or parsed.get("path"),
             is_wiki=bool(parsed.get("wiki")),
+            token=token,
         )
 
     if source.startswith("s3://"):
@@ -427,13 +434,14 @@ def sync(
             entry_branch = entry.get("branch")
             entry_path = entry.get("path")
             entry_filter = entry.get("filter", {})
+            entry_token = entry.get("token")
 
             if not entry_source or not entry_kb:
                 click.echo(click.style(f"Skipping invalid entry (needs source + kb-id): {entry}", fg="yellow"), err=True)
                 continue
 
             try:
-                connector = _resolve_connector(entry_source, entry_branch, entry_path)
+                connector = _resolve_connector(entry_source, entry_branch, entry_path, token)
                 client = _make_client(url, token)
 
                 if not quiet:
