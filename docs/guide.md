@@ -156,6 +156,39 @@ Then sync all sources at once:
 oikb sync
 ```
 
+### Multiple sources in one Knowledge Base
+
+Entries with the same `kb-id` are scanned together and sent as one manifest.
+This prevents a sync of one source from deleting files belonging to another.
+`oikb sync --name NAME`, daemon schedules, and webhooks all sync the entire
+configured group. Each entry keeps its schedule; whenever one is due, the whole
+group runs under the existing KB lock. Use the same `url` and `token` settings
+for every entry in a group.
+
+```yaml
+sources:
+  - name: engineering
+    source: confluence:ENG
+    kb-id: shared-kb
+    target-path: ENG
+  - name: handbook
+    source: ./handbook
+    kb-id: shared-kb
+    target-path: handbook
+```
+
+`target-path` is an optional destination directory. Filters still match paths
+inside each source, before this prefix is applied. In a group with multiple
+sources, Confluence entries default to their space key as the destination
+directory; other connectors keep their original paths. Explicit `target-path`
+values keep paths stable when sources are added or removed. Duplicate destination
+paths or a failed source scan abort the group before any KB changes.
+
+Existing single-source paths remain unchanged. Combining previously separate
+sources can relocate files; preview with `oikb sync --dry-run`. Use YAML mode
+for a shared KB: a standalone `oikb sync SOURCE --kb-id ID` only knows about that
+one source.
+
 ### Global Defaults
 
 Avoid repeating the same config across entries:
@@ -256,7 +289,30 @@ With hierarchical structure enabled, existing `filter.include` and
 `filter.exclude` patterns can select page trees, for example
 `Engineering/Runbooks*`.
 
-Requires `CONFLUENCE_URL`, `CONFLUENCE_USER`, and `CONFLUENCE_TOKEN`.
+Cloud uses REST API v2 by default. Set `CONFLUENCE_URL` to your instance URL,
+`CONFLUENCE_USER` to your email, and `CONFLUENCE_TOKEN` to your API token.
+
+For Server/Data Center, select v1 and omit the user to use a personal access token:
+
+```bash
+export CONFLUENCE_API_VERSION=v1
+export CONFLUENCE_URL=https://wiki.example.com/confluence
+export CONFLUENCE_TOKEN=your-personal-access-token
+unset CONFLUENCE_USER
+oikb sync confluence:ENG --kb-id your-kb-id
+```
+
+Include your installation's context path (such as `/confluence`) in the URL.
+Both versions support flat and hierarchical paths. A user plus token selects
+Basic authentication; a token alone selects Bearer authentication, as described
+in [Atlassian's PAT documentation](https://confluence.atlassian.com/enterprise/using-personal-access-tokens-1026032365.html).
+Per-source `auth` keys `base_url`, `user`, `token`, and `api_version` override
+environment settings, so Cloud and Data Center can coexist in one config. Set
+`user: ""` to override an inherited user when using a PAT.
+
+Page titles that map to the same filename receive page-ID suffixes. Macro text
+and code blocks retain the existing extraction behavior; blank or index-only
+pages are skipped with a warning.
 
 ### BookStack
 

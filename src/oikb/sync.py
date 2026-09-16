@@ -381,7 +381,14 @@ def _run_sync_inner(
                     check_stop()
                     last_err = e
                     continue
-                last_err = e
+                detail = e.response.text.strip()
+                try:
+                    payload = e.response.json()
+                    if isinstance(payload, dict) and payload.get("detail"):
+                        detail = str(payload["detail"])
+                except ValueError:
+                    pass
+                last_err = RuntimeError(f"{e} — {detail}") if detail else e
                 break
             except SyncCancelled:
                 raise

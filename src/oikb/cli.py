@@ -109,7 +109,10 @@ def _resolve_connector(
         parsed = parse_confluence_source(source)
         return ConfluenceConnector(
             space_key=parsed["space_key"],
-            base_url=parsed.get("base_url"),
+            base_url=auth.get("base_url") or parsed.get("base_url"),
+            user=auth.get("user"),
+            token=auth.get("token"),
+            api_version=auth.get("api_version"),
             structure=parsed.get("structure", "flat"),
         )
 
@@ -465,55 +468,33 @@ def sync(
             )
             sys.exit(1)
 
-        # Filter by --name if specified.
+        from oikb.kb_sync import group_entries_by_kb, run_entries_sync
+
+        try:
+            groups = group_entries_by_kb(entries)
+        except ValueError as e:
+            raise click.ClickException(str(e)) from e
         if name:
-            entries = [e for e in entries if e.get("name") == name or e.get("kb-id") == name]
-            if not entries:
-                click.echo(click.style(f"No entry matching '{name}' in .oikb.yaml", fg="red"), err=True)
-                sys.exit(1)
+            groups = [group for group in groups if any(
+                e.get("name") == name or e["kb-id"] == name for e in group
+            )]
+            if not groups:
+                raise click.ClickException(f"No entry matching '{name}' in .oikb.yaml")
 
         has_errors = False
-        for entry in entries:
-            entry_source = entry.get("source")
-            entry_kb = entry.get("kb-id")
-            entry_branch = entry.get("branch")
-            entry_path = entry.get("path")
-            entry_filter = entry.get("filter", {})
-            entry_auth = entry.get("auth", {})
-
-            if not entry_source or not entry_kb:
-                click.echo(click.style(f"Skipping invalid entry (needs source + kb-id): {entry}", fg="yellow"), err=True)
-                continue
-
+        for group in groups:
+            entry = group[0]
+            client = None
             try:
-                connector = _resolve_connector(entry_source, entry_branch, entry_path, auth=entry_auth)
-                client = _make_client(url, token)
-
+                client = _make_client(url or entry.get("url"), token or entry.get("token"))
                 if not quiet:
                     click.echo(f"\n{'─' * 40}")
-                    click.echo(f"Syncing: {entry_source} → {entry_kb}")
+                    click.echo(f"Syncing: {', '.join(e['source'] for e in group)} → {entry['kb-id']}")
 
-                mf = None
-                inc = entry_filter.get("include")
-                exc = entry_filter.get("exclude")
-                ms = entry_filter.get("max-size") or max_file_size
-                if inc or exc or ms:
-                    from oikb.sync import build_manifest_filter, parse_size
-                    mf = build_manifest_filter(
-                        include=inc,
-                        exclude=exc,
-                        max_size=parse_size(ms),
-                    )
-
-                result = run_sync(
-                    client=client,
-                    connector=connector,
-                    kb_id=entry_kb,
-                    dry_run=dry_run,
-                    verbose=verbose,
-                    quiet=quiet,
-                    manifest_filter=mf,
-                    concurrency=entry.get("concurrency", concurrency),
+                result = run_entries_sync(
+                    client, group, resolve_connector=_resolve_connector,
+                    dry_run=dry_run, verbose=verbose, quiet=quiet,
+                    concurrency=concurrency, max_file_size=max_file_size,
                 )
 
                 if not quiet:
@@ -538,11 +519,12 @@ def sync(
                 if result.errors:
                     has_errors = True
 
-                client.close()
-
             except Exception as e:
                 click.echo(click.style(f"  Failed: {e}", fg="red"), err=True)
                 has_errors = True
+            finally:
+                if client:
+                    client.close()
 
         if has_errors:
             sys.exit(1)

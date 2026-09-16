@@ -1,7 +1,8 @@
 """Confluence connector — sync a Confluence space to a Knowledge Base.
 
-Uses the Confluence Cloud REST API v2. Pages are exported as plain text.
-Auth via CONFLUENCE_URL, CONFLUENCE_USER, CONFLUENCE_TOKEN env vars.
+Supports Cloud REST API v2 (default) and Server/Data Center REST API v1.
+Set CONFLUENCE_API_VERSION=v1 for Server/Data Center. Authentication uses
+Basic auth with CONFLUENCE_USER, or Bearer auth when only a token is supplied.
 """
 
 from __future__ import annotations
@@ -10,6 +11,8 @@ import hashlib
 import html
 import os
 import re
+from collections import Counter
+from dataclasses import replace
 from typing import Any
 from urllib.parse import parse_qsl, urlsplit
 
@@ -68,7 +71,7 @@ def _storage_to_text(storage_html: str) -> str:
 
 
 class ConfluenceConnector(BaseConnector):
-    """Sync pages from a Confluence Cloud space.
+    """Sync pages from a Confluence space.
 
     Args:
         space_key: Confluence space key (e.g. "ENG").
@@ -76,6 +79,7 @@ class ConfluenceConnector(BaseConnector):
         user:      Confluence user email (or CONFLUENCE_USER env var).
         token:     Confluence API token (or CONFLUENCE_TOKEN env var).
         structure: "flat" or "hierarchical" manifest paths.
+        api_version: "v1" or "v2" (or CONFLUENCE_API_VERSION, default "v2").
     """
 
     def __init__(
@@ -85,14 +89,18 @@ class ConfluenceConnector(BaseConnector):
         user: str | None = None,
         token: str | None = None,
         structure: str = "flat",
+        api_version: str | None = None,
     ):
         if structure not in {"flat", "hierarchical"}:
             raise ValueError("structure must be 'flat' or 'hierarchical'")
         self.space_key = space_key
         self.structure = structure
+        self._api_version = (api_version or os.environ.get("CONFLUENCE_API_VERSION", "v2")).lower()
+        if self._api_version not in {"v1", "v2"}:
+            raise ValueError("CONFLUENCE_API_VERSION must be 'v1' or 'v2'")
 
         self._base_url = (base_url or os.environ.get("CONFLUENCE_URL", "")).rstrip("/")
-        self._user = user or os.environ.get("CONFLUENCE_USER", "")
+        self._user = user if user is not None else os.environ.get("CONFLUENCE_USER", "")
         self._token = token or os.environ.get("CONFLUENCE_TOKEN", "")
 
         if not self._base_url:
@@ -106,15 +114,21 @@ class ConfluenceConnector(BaseConnector):
                 "  export CONFLUENCE_TOKEN=<api_token>"
             )
 
+        headers = {"Accept": "application/json"}
+        if not self._user:
+            headers["Authorization"] = f"Bearer {self._token}"
+        api_base = self._base_url
+        if self._api_version == "v2" and not api_base.endswith("/wiki"):
+            api_base += "/wiki"
         self._http = httpx.Client(
-            base_url=f"{self._base_url}/wiki",
+            base_url=api_base,
             auth=(self._user, self._token) if self._user else None,
-            headers={"Accept": "application/json"},
+            headers=headers,
             timeout=60.0,
         )
 
         # Resolve space key to numeric ID (v2 API requires ID).
-        if not self.space_key.isdecimal():
+        if self._api_version == "v2" and not self.space_key.isdecimal():
             try:
                 resp = self._http.get(
                     "/api/v2/spaces", params={"keys": [self.space_key]}
@@ -140,50 +154,66 @@ class ConfluenceConnector(BaseConnector):
         """List all pages in the space and build a manifest."""
         self._page_cache.clear()
         pages: list[dict[str, Any]] = []
-        cursor = None
+        params: dict[str, Any] = {"limit": 250}
+        endpoint = f"/api/v2/spaces/{self.space_key}/pages"
+        if self._api_version == "v1":
+            endpoint = "/rest/api/content"
+            params.update(spaceKey=self.space_key, type="page", start=0, expand="ancestors,version")
+        seen_pages: set[str] = set()
 
         while True:
-            params: dict[str, Any] = {"limit": 250}
-            if cursor:
-                params["cursor"] = cursor
-
-            resp = self._http.get(
-                f"/api/v2/spaces/{self.space_key}/pages",
-                params=params,
-            )
+            resp = self._http.get(endpoint, params=params)
             resp.raise_for_status()
             data = resp.json()
 
-            pages.extend(data.get("results", []))
+            results = data["results"]
+            for page in results:
+                page_id = str(page["id"])
+                if page_id in seen_pages:
+                    raise ValueError(f"Repeated Confluence page in pagination: {page_id}")
+                seen_pages.add(page_id)
+            pages.extend(results)
 
             # Handle pagination.
             next_link = data.get("_links", {}).get("next")
             if not next_link:
                 break
-            # Extract cursor from next link.
-            cursor_match = re.search(r"cursor=([^&]+)", next_link)
-            cursor = cursor_match.group(1) if cursor_match else None
-            if not cursor:
-                break
+            # Use only pagination parameters, never a server-provided host/path.
+            parameter = "start" if self._api_version == "v1" else "cursor"
+            next_value = dict(parse_qsl(urlsplit(next_link).query)).get(parameter)
+            if not results or not next_value or str(params.get(parameter)) == next_value:
+                raise ValueError("Invalid Confluence pagination link")
+            if parameter == "start" and int(next_value) <= int(params["start"]):
+                raise ValueError("Confluence pagination did not advance")
+            params[parameter] = next_value
 
         pages_by_id = {str(page["id"]): page for page in pages}
         entries = [self._page_entry(page, pages_by_id) for page in pages]
+        counts = Counter(entry.display_path for entry in entries)
+        reserved = set(counts)
+        for index, (page, entry) in enumerate(zip(pages, entries)):
+            if counts[entry.display_path] > 1:
+                # Rename every colliding title so API ordering cannot change identity.
+                stem = entry.filename.removesuffix(".txt") + f"_{page['id']}"
+                candidate = replace(entry, filename=f"{stem}.txt")
+                while candidate.display_path in reserved:
+                    stem += "_"
+                    candidate = replace(entry, filename=f"{stem}.txt")
+                entry = entries[index] = candidate
+                reserved.add(entry.display_path)
+            self._page_cache[entry.display_path] = str(page["id"])
         entries.sort(key=lambda e: e.display_path)
         return entries
 
     def _page_entry(
         self, page: dict[str, Any], pages_by_id: dict[str, dict[str, Any]]
     ) -> ManifestEntry:
-        page_id = page["id"]
+        page_id = str(page["id"])
         title = page["title"]
         version = page.get("version", {}).get("number", 0)
         checksum = hashlib.sha256(f"{page_id}:v{version}".encode()).hexdigest()[:16]
         filename = self._safe_name(title) + ".txt"
         path = self._page_path(page, pages_by_id)
-        cache_key = self._entry_key(path, filename)
-        if self.structure == "hierarchical" and cache_key in self._page_cache:
-            raise ValueError(f"Duplicate Confluence page path: {cache_key}")
-        self._page_cache[cache_key] = page_id
         return ManifestEntry(filename=filename, path=path, checksum=checksum, size=0)
 
     def _page_path(
@@ -191,6 +221,8 @@ class ConfluenceConnector(BaseConnector):
     ) -> str:
         if self.structure != "hierarchical":
             return ""
+        if self._api_version == "v1":
+            return "/".join(self._safe_name(a.get("title")) for a in page.get("ancestors", []))
 
         ancestors: list[str] = []
         parent_id = page.get("parentId")
@@ -222,10 +254,10 @@ class ConfluenceConnector(BaseConnector):
         if not page_id:
             raise FileNotFoundError(f"Page not found: {filename}")
 
-        resp = self._http.get(
-            f"/api/v2/pages/{page_id}",
-            params={"body-format": "storage"},
-        )
+        if self._api_version == "v1":
+            resp = self._http.get(f"/rest/api/content/{page_id}", params={"expand": "body.storage"})
+        else:
+            resp = self._http.get(f"/api/v2/pages/{page_id}", params={"body-format": "storage"})
         resp.raise_for_status()
         data = resp.json()
 
@@ -256,8 +288,11 @@ def parse_confluence_source(source: str) -> dict[str, str | None]:
     source = source.removeprefix("confluence:")
     is_url = source.startswith(("http://", "https://"))
     parsed = urlsplit(source if is_url else f"confluence://{source}")
-    space_key = parsed.path.strip("/") if is_url else parsed.netloc
-    if not space_key or "/" in space_key:
+    base_path = ""
+    space_key = parsed.netloc
+    if is_url:
+        base_path, _, space_key = parsed.path.rstrip("/").rpartition("/")
+    if not space_key or (not is_url and parsed.path):
         raise ValueError("Invalid Confluence source. Expected: confluence:SPACEKEY")
 
     params = dict(parse_qsl(parsed.query, keep_blank_values=True))
@@ -269,7 +304,7 @@ def parse_confluence_source(source: str) -> dict[str, str | None]:
         raise ValueError("Invalid Confluence source. Expected structure=flat or structure=hierarchical")
 
     return {
-        "base_url": f"{parsed.scheme}://{parsed.netloc}" if is_url else None,
+        "base_url": f"{parsed.scheme}://{parsed.netloc}{base_path}" if is_url else None,
         "space_key": space_key,
         "structure": structure,
     }
